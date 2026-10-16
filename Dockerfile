@@ -1,0 +1,2021 @@
+# syntax=docker/dockerfile:1
+
+FROM ghcr.io/flaresolverr/flaresolverr:latest
+
+USER root
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive \
+    LOG_HTML=false CAPTCHA_SOLVER=none TZ=UTC \
+    ELMINYAWE_HEADLESS=false MAX_CONCURRENT_SOLVES=2 \
+    SOLVER_URL=http://127.0.0.1:8194
+
+RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' requests patchright \
+ && python -m patchright install --with-deps chromium \
+ && python -m patchright install chrome \
+ && apt-get update && apt-get install -y --no-install-recommends xvfb fonts-liberation fonts-dejavu-core ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN mkdir -p /app/turn /app/ug
+
+RUN cat > /app/turn/elminyawe_engine.py <<'ELMINYAWE_SOURCE_0'
+# ============================================================
+#  ELMINYAWE Engine - Cloudflare Turnstile solving core (v3.4.0)
+#  Algorithm: Theyka/Turnstile-Solver (patchright + Turnstile
+#  widget injection + checkbox click loop).
+#  ELMINYAWE hardening for single-container use:
+#    - Docker-safe Chromium launch flags (--no-sandbox, --disable-dev-shm-usage)
+#    - browser channel support: chromium (full build, new headless) /
+#      chrome / msedge (system installs) like the reference API server
+#    - per-solve proxy support (parsed into patchright format)
+#    - configurable attempts / user-agent / headless
+#  v3.3.0 stealth posture (reference-parity, proven in production):
+#    - no forced UA by default: headed mode uses the real browser UA
+#      (consistent with navigator.userAgentData - a mismatched UA is a
+#      known detection signal); headless mode auto-builds a UA that
+#      matches the real browser version
+#    - GPU stack untouched (no --disable-gpu/--disable-software-rasterizer)
+#      so WebGL/WebGPU fingerprints stay identical to a real browser
+# ============================================================
+import os
+import shlex
+import time
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urlsplit
+
+from patchright.sync_api import sync_playwright
+
+DEFAULT_UA = os.environ.get(
+    "ELMINYAWE_UA",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+)
+#  Auto UA (headless + none provided): built from the REAL browser version
+#  so navigator.userAgent and the binary always agree on the major version.
+UA_TEMPLATE = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+)
+DEFAULT_ATTEMPTS = int(os.environ.get("SOLVE_ATTEMPTS", "10"))
+
+# Flags that keep Chromium stable inside containers.
+#  v3.3.0: --disable-gpu / --disable-software-rasterizer REMOVED on purpose
+#  (the reference solver passes nothing like them; killing the GPU stack
+#  degrades WebGL/WebGPU fingerprints and raises risk scoring).
+DOCKER_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--window-size=1280,720",
+]
+
+# Browser channel per browser_type (same mapping the reference API server
+# passes to patchright: chromium = full build with the new headless mode,
+# chrome/msedge = system-installed browsers when present)
+BROWSER_CHANNELS = {
+    "chromium": "chromium",
+    "chrome": "chrome",
+    "msedge": "msedge",
+}
+
+
+@dataclass
+class TurnstileResult:
+    turnstile_value: Optional[str]
+    elapsed_time_seconds: float
+    status: str                    # success | failure | error
+    reason: Optional[str] = None
+
+
+def parse_proxy(proxy: Optional[str]) -> Optional[dict]:
+    """
+    Accepts:  host:port | scheme://host:port | scheme://user:pass@host:port
+    Returns:  patchright proxy dict, or None when empty/invalid.
+    """
+    if not proxy or not str(proxy).strip():
+        return None
+    raw = str(proxy).strip()
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parts = urlsplit(raw)
+        if not parts.hostname:
+            return None
+        default_port = 443 if parts.scheme == "https" else 80
+        server = f"{parts.scheme or 'http'}://{parts.hostname}:{parts.port or default_port}"
+        out = {"server": server}
+        if parts.username:
+            out["username"] = parts.username
+        if parts.password:
+            out["password"] = parts.password
+        return out
+    except Exception:
+        return None
+
+
+class TurnstileSolver:
+    """ELMINYAWE Turnstile engine (Theyka/Turnstile-Solver algorithm)."""
+
+    HTML_TEMPLATE = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>ELMINYAWE</title>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async></script>
+        <script>
+            async function fetchIP() {
+                try {
+                    const response = await fetch('https://api64.ipify.org?format=json');
+                    const data = await response.json();
+                    document.getElementById('ip-display').innerText = `Your IP: ${data.ip}`;
+                } catch (error) {
+                    console.error('Error fetching IP:', error);
+                    document.getElementById('ip-display').innerText = 'Failed to fetch IP';
+                }
+            }
+            window.onload = fetchIP;
+        </script>
+    </head>
+    <body>
+        <!-- cf turnstile -->
+        <p id="ip-display">Fetching your IP...</p>
+    </body>
+    </html>
+    """
+
+    def __init__(self, headless: bool = True, useragent: Optional[str] = None,
+                 browser_type: str = "chromium", attempts: Optional[int] = None):
+        self.headless = bool(headless)
+        #  v3.3.0 UA policy (reference-parity): only an explicitly provided
+        #  UA (parameter or ELMINYAWE_UA) is forced onto the browser. In
+        #  headed mode the real browser UA is used as-is; in headless mode
+        #  a version-matched UA is auto-built at solve time when none given.
+        self.useragent = useragent or os.environ.get("ELMINYAWE_UA") or None
+        self.browser_type = browser_type
+        self.attempts = max(1, int(attempts or DEFAULT_ATTEMPTS))
+        self.browser_args = list(DOCKER_ARGS)
+        if self.useragent:
+            self.browser_args.append(f"--user-agent={self.useragent}")
+        extra_args = os.environ.get("ELMINYAWE_CHROMIUM_ARGS", "")
+        if extra_args.strip():
+            self.browser_args.extend(shlex.split(extra_args.strip()))
+
+    def solve(self, url: str, sitekey: str, action: Optional[str] = None,
+              cdata: Optional[str] = None, proxy: Optional[str] = None) -> TurnstileResult:
+        start_time = time.time()
+        playwright = None
+        browser = None
+        try:
+            playwright = sync_playwright().start()
+            browser = playwright.chromium.launch(
+                channel=BROWSER_CHANNELS.get(self.browser_type, "chromium"),
+                headless=self.headless,
+                args=self.browser_args,
+            )
+            context_kwargs = {"proxy": parse_proxy(proxy)}
+            if self.headless and not self.useragent:
+                #  headless + no explicit UA -> auto UA matching the real
+                #  browser version (navigator.userAgent stays consistent)
+                major = ""
+                try:
+                    major = str(browser.version or "").split(".")[0]
+                except Exception:
+                    pass
+                if not major:
+                    major = DEFAULT_UA.split("Chrome/")[1].split(".")[0]
+                context_kwargs["user_agent"] = UA_TEMPLATE.format(major=major)
+            context = browser.new_context(**context_kwargs)
+            page = context.new_page()
+
+            url_with_slash = url + "/" if not url.endswith("/") else url
+
+            turnstile_div = (
+                '<div class="cf-turnstile" style="background: white;" '
+                f'data-sitekey="{sitekey}"'
+                + (f' data-action="{action}"' if action else "")
+                + (f' data-cdata="{cdata}"' if cdata else "")
+                + "></div>"
+            )
+            page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
+
+            page.route(url_with_slash, lambda route: route.fulfill(body=page_data, status=200))
+            page.goto(url_with_slash)
+
+            # shrink the widget so the checkbox sits at a natural click position
+            try:
+                page.eval_on_selector(
+                    "//div[@class='cf-turnstile']", "el => el.style.width = '70px'"
+                )
+            except Exception:
+                pass
+
+            turnstile_value = None
+            for _ in range(self.attempts):
+                try:
+                    check = page.input_value("[name=cf-turnstile-response]", timeout=2000)
+                    if check == "":
+                        try:
+                            page.locator("//div[@class='cf-turnstile']").click(timeout=1000)
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                    else:
+                        turnstile_value = check
+                        break
+                except Exception:
+                    pass
+
+            elapsed = round(time.time() - start_time, 3)
+            if turnstile_value:
+                return TurnstileResult(
+                    turnstile_value=turnstile_value,
+                    elapsed_time_seconds=elapsed,
+                    status="success",
+                )
+            return TurnstileResult(
+                turnstile_value=None,
+                elapsed_time_seconds=elapsed,
+                status="failure",
+                reason="Max attempts reached without token retrieval",
+            )
+        except Exception as exc:
+            elapsed = round(time.time() - start_time, 3)
+            return TurnstileResult(
+                turnstile_value=None,
+                elapsed_time_seconds=elapsed,
+                status="error",
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            for obj, meth in ((browser, "close"), (playwright, "stop")):
+                if obj is not None:
+                    try:
+                        getattr(obj, meth)()
+                    except Exception:
+                        pass
+ELMINYAWE_SOURCE_0
+
+RUN cat > /app/turn/elminyawe_api.py <<'ELMINYAWE_SOURCE_1'
+# ============================================================
+#  ELMINYAWE Solver - Public API Gateway (v3.4.0)
+#  Solves Cloudflare Turnstile challenges; the most important
+#  values (the token) come FIRST in every response.
+#
+#  Endpoints:
+#    GET  /                       -> service info
+#    GET  /health                 -> health check
+#    GET  /diagnose               -> engine + connectivity diagnostics
+#                                    (IPv4/IPv6 path to the challenge
+#                                    infrastructure; ?selftest=true runs a
+#                                    live solve with a test sitekey)
+#    GET  /solve?url=&sitekey=&secret=  -> quick solve (both optional)
+#    POST /v1 {url, sitekey?, action?, cdata?, proxy?, headless?,
+#              useragent?, maxTimeout?, secret?}
+#    GET/POST /siteverify {token, secret} -> validate any token through
+#              Cloudflare siteverify and return the verdict
+#    GET/POST /task {url, sitekey?, ...}  -> async solve, returns task_id
+#              immediately (202); solve runs in the background
+#    GET  /result?task_id=...             -> poll an async task for the token
+#    GET  /tasks                          -> list tracked tasks
+#
+#  'browser' is optional everywhere: chromium (default, full build with
+#  new headless), chrome (real Google Chrome, preinstalled), msedge.
+#  STEALTH POSTURE: headed browser on the built-in virtual display by
+#  default with the real browser User-Agent (reference solver parity);
+#  headless mode auto-uses a version-matched UA. A mismatched/forced UA
+#  is a known Cloudflare detection signal - that is why v3.3.0 never
+#  forces one unless explicitly asked (useragent param / ELMINYAWE_UA).
+#  Failed solves carry targeted 'hints' (result.hints) diagnosing the most
+#  likely environmental cause (e.g. missing IPv6 egress for IPv6-only
+#  challenge endpoints) - same smart-inspection spirit as sitekey detection.
+#
+#  Fully white-labeled: everything appears as ELMINYAWE.
+# ============================================================
+import os
+import re
+import socket
+import json
+import time
+import glob
+import inspect
+import logging
+import ssl
+import threading
+import urllib.parse
+import urllib.request
+import uuid
+from typing import Optional
+
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.concurrency import run_in_threadpool
+
+# --- engine (must be imported after the API's own config below) -------------
+from elminyawe_engine import TurnstileSolver, DEFAULT_UA
+
+VERSION = "3.4.0"
+SERVICE_NAME = "ELMINYAWE Solver"
+#  Listening ports reported by /health (populated by elminyawe_launch.py:
+#  primary public API port first, platform compat alias second, if any).
+_LISTENERS = os.environ.get("ELMINYAWE_LISTENERS", "8191")
+
+MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_SOLVES", "2")))
+WORKER_WAIT = int(os.environ.get("WORKER_WAIT_TIMEOUT", "5"))
+PAGE_FETCH_TIMEOUT = int(os.environ.get("PAGE_FETCH_TIMEOUT", "15"))
+SITEVERIFY_TIMEOUT = int(os.environ.get("SITEVERIFY_TIMEOUT", "10"))
+MAX_HTML_BYTES = 3_000_000
+SITEVERIFY_MAX_BYTES = 1_000_000
+# Cloudflare's documented behavior: Turnstile TEST sitekeys always return
+# this exact dummy token (developers.cloudflare.com/turnstile/troubleshooting/testing)
+DUMMY_TOKEN = "XXXX.DUMMY.TOKEN.XXXX"
+SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+# Async task API (task_id + /result polling)
+TASK_TTL = int(os.environ.get("TASK_TTL_SECONDS", "1800"))
+TASK_WAIT = int(os.environ.get("TASK_WAIT_TIMEOUT", "120"))
+ALLOWED_BROWSERS = ("chromium", "chrome", "msedge")
+BROWSER_DEFAULT = os.environ.get("ELMINYAWE_BROWSER", "chromium").strip().lower() or "chromium"
+if BROWSER_DEFAULT not in ALLOWED_BROWSERS:
+    BROWSER_DEFAULT = "chromium"
+HEADLESS_DEFAULT = os.environ.get("ELMINYAWE_HEADLESS", "false").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("ELMINYAWE")
+
+app = FastAPI(
+    title=SERVICE_NAME,
+    version=VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+_WORKERS = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+# ------------------------------------------------------------------
+#  White-label safety: strip internal engine names from any message
+# ------------------------------------------------------------------
+_LEAKS = (
+    ("TurnstileAPIServer", "elminyawe-engine"),
+    ("TurnstileSolver", "ElminyaweSolver"),
+    ("turnstile_solver", "elminyawe-engine"),
+    ("turnstile-solver", "elminyawe-engine"),
+    ("elminyawe_engine", "engine"),
+    ("patchright", "engine"),
+    ("Patchright", "engine"),
+    ("playwright", "engine"),
+    ("Playwright", "engine"),
+    ("camoufox", "engine"),
+    ("sync_solver", "engine"),
+)
+
+
+def _rebrand(text):
+    if not isinstance(text, str):
+        return text
+    for leaked, branded in _LEAKS:
+        text = text.replace(leaked, branded)
+    return text
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+# ------------------------------------------------------------------
+#  Smart inspection - find the Turnstile widget on the target page
+# ------------------------------------------------------------------
+RE_DATA_SITEKEY = re.compile(
+    r"""data-sitekey\s*=\s*["']([0-9A-Za-z_\-]{20,60})["']""", re.I
+)
+RE_JSON_SITEKEY = re.compile(r""""sitekey"\s*:\s*"([0-9A-Za-z_\-]{20,60})""" , re.I)
+RE_TURNSTILE_MARK = re.compile(
+    r"""challenges\.cloudflare\.com/turnstile|cf-turnstile-response""", re.I
+)
+RE_ACTION = re.compile(r"""data-action\s*=\s*["']([^"']{1,120})["']""", re.I)
+RE_CDATA = re.compile(r"""data-cdata\s*=\s*["']([^"']{1,300})["']""", re.I)
+RE_WIDGET_ATTR = re.compile(
+    r"""data-(theme|size|appearance|retry|refresh-expired)\s*=\s*["']([^"']{1,40})["']""",
+    re.I,
+)
+
+
+def _fetch_page(url: str):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=PAGE_FETCH_TIMEOUT, context=ctx) as resp:
+        return int(resp.getcode() or 0), resp.read(MAX_HTML_BYTES).decode("utf-8", "replace")
+
+
+def _inspect_page(url: str):
+    """Fetch the target page and locate the Turnstile widget + its settings."""
+    info = {
+        "page_fetched": False,
+        "has_turnstile": False,
+        "sitekey": None,
+        "sitekey_source": None,
+        "widget": {},
+    }
+    try:
+        code, html = _fetch_page(url)
+        info["page_fetched"] = True
+        info["http_status"] = code
+    except Exception as exc:
+        info["error"] = _rebrand(f"{type(exc).__name__}: {exc}")
+        return info
+
+    if RE_TURNSTILE_MARK.search(html):
+        info["has_turnstile"] = True
+
+    match = RE_DATA_SITEKEY.search(html)
+    if match:
+        info["sitekey"] = match.group(1)
+        info["sitekey_source"] = "auto_detected:data-sitekey"
+    else:
+        match = RE_JSON_SITEKEY.search(html)
+        if match:
+            info["sitekey"] = match.group(1)
+            info["sitekey_source"] = "auto_detected:embedded"
+
+    for key, rx in (("action", RE_ACTION), ("cdata", RE_CDATA)):
+        m = rx.search(html)
+        if m:
+            info["widget"][key] = m.group(1)
+    for m in RE_WIDGET_ATTR.finditer(html):
+        if m.group(1) not in info["widget"]:
+            info["widget"][m.group(1)] = m.group(2)
+    return info
+
+
+# ------------------------------------------------------------------
+#  Engine bridge
+# ------------------------------------------------------------------
+def _solve_turnstile(url, sitekey, action=None, cdata=None, proxy=None,
+                     headless=True, useragent=None, attempts=None,
+                     browser=None):
+    solver = TurnstileSolver(
+        headless=headless,
+        useragent=useragent,
+        browser_type=browser or BROWSER_DEFAULT,
+        attempts=attempts,
+    )
+    return solver.solve(url=url, sitekey=sitekey, action=action,
+                        cdata=cdata, proxy=proxy)
+
+
+# ------------------------------------------------------------------
+#  Server-side validation through Cloudflare siteverify (optional)
+# ------------------------------------------------------------------
+def _siteverify(token, secret):
+    """Validate a Turnstile token server-side via Cloudflare siteverify."""
+    t0 = _now_ms()
+    data = urllib.parse.urlencode({
+        "secret": str(secret),
+        "response": str(token),
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            SITEVERIFY_URL,
+            data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": _UA,
+            },
+            method="POST",
+        )
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(
+            req, timeout=SITEVERIFY_TIMEOUT, context=ctx
+        ) as resp:
+            payload = json.loads(
+                resp.read(SITEVERIFY_MAX_BYTES).decode("utf-8", "replace")
+            )
+        if not isinstance(payload, dict):
+            raise ValueError("siteverify returned a non-object payload")
+        out = {
+            "success": bool(payload.get("success")),
+            "challenge_ts": payload.get("challenge_ts"),
+            "hostname": payload.get("hostname"),
+            "error_codes": payload.get("error-codes") or [],
+        }
+        if payload.get("messages"):
+            out["messages"] = payload["messages"]
+        if isinstance(payload.get("metadata"), dict):
+            out["metadata"] = payload["metadata"]
+        out["verified_in_ms"] = _now_ms() - t0
+        return out
+    except Exception as exc:
+        return {
+            "success": None,
+            "error": _rebrand(f"{type(exc).__name__}: {exc}"),
+            "verified_in_ms": _now_ms() - t0,
+        }
+
+
+# ------------------------------------------------------------------
+#  Connectivity diagnostics (smart failure hints + /diagnose)
+# ------------------------------------------------------------------
+#  Some Turnstile widgets route parts of their challenge through
+#  IPv6-only Cloudflare endpoints (e.g. brunhild.challenges.cloudflare.com
+#  has AAAA records and NO A records at all). On IPv4-only hosts those
+#  challenges can never complete. We probe both paths once and reuse the
+#  result to (a) explain failed solves with targeted hints and
+#  (b) power GET /diagnose.
+_IPV6_PROBE_HOST = "brunhild.challenges.cloudflare.com"
+_IPV4_PROBE_HOST = "challenges.cloudflare.com"
+_PROBE_CACHE = {"ts": 0.0, "v4": None, "v6": None}
+_PROBE_TTL = 300.0
+
+
+def _tcp_probe(host, family=None, timeout=3.0):
+    """TCP connect to host:443. Returns (ok, detail, elapsed_ms)."""
+    t0 = _now_ms()
+    try:
+        infos = socket.getaddrinfo(host, 443, family, socket.SOCK_STREAM)
+    except Exception as exc:
+        return False, f"dns: {type(exc).__name__}", _now_ms() - t0
+    last_err = None
+    for _fam, _typ, _proto, _cn, sa in infos[:4]:
+        sock = None
+        try:
+            sock = socket.socket(_fam, _typ, _proto)
+            sock.settimeout(timeout)
+            sock.connect(sa)
+            return True, f"connected to {sa[0]}", _now_ms() - t0
+        except Exception as exc:
+            last_err = exc
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    return False, f"connect failed: {last_err}", _now_ms() - t0
+
+
+def _connectivity_probe():
+    """Cached (TTL) probe of the IPv4 and IPv6 paths to the challenge infra."""
+    now = time.time()
+    if _PROBE_CACHE["v4"] is None or now - _PROBE_CACHE["ts"] > _PROBE_TTL:
+        _PROBE_CACHE["v4"] = _tcp_probe(_IPV4_PROBE_HOST, socket.AF_INET)
+        _PROBE_CACHE["v6"] = _tcp_probe(_IPV6_PROBE_HOST, socket.AF_INET6)
+        _PROBE_CACHE["ts"] = now
+    return _PROBE_CACHE
+
+
+def _failure_hints():
+    """Targeted hints appended to failed solves (smart inspection)."""
+    hints = []
+    probe = _connectivity_probe()
+    v4_ok, v4_detail, _ = probe["v4"]
+    v6_ok, v6_detail, _ = probe["v6"]
+    if not v4_ok:
+        hints.append(
+            "This host cannot reach " + _IPV4_PROBE_HOST + " over IPv4 "
+            "(" + str(v4_detail) + "); Turnstile solving is impossible "
+            "from here. Check outbound firewall/egress rules."
+        )
+        return hints
+    if not v6_ok:
+        hints.append(
+            "This host has no usable IPv6 egress (" + str(v6_detail) + "). "
+            "Some Turnstile widgets route parts of their challenge through "
+            "IPv6-only Cloudflare endpoints (e.g. " + _IPV6_PROBE_HOST +
+            " has no IPv4 address at all), so those challenges cannot "
+            "complete here. Fixes: pass an IPv6-capable 'proxy' per "
+            "request, or enable Outbound IPv6 (Railway: Settings > "
+            "Networking > Enable Outbound IPv6, then redeploy), or deploy "
+            "on an IPv6-enabled host. Widgets that stay on dual-stack "
+            "endpoints keep working normally."
+        )
+    if not hints:
+        hints.append(
+            "Connectivity to the challenge infrastructure looks healthy, "
+            "so the failure is widget-side (the interactive challenge "
+            "rejected the browser fingerprint/IP risk): retry, raise "
+            "maxTimeout, or pass a cleaner 'proxy'."
+        )
+    return hints
+
+
+# ------------------------------------------------------------------
+#  Response builders (ELMINYAWE envelope, token first)
+# ------------------------------------------------------------------
+def _ok_body(url, sitekey, sitekey_source, token, widget, action, cdata,
+             proxy, headless, useragent, started, engine_result,
+             siteverify=None, browser=None):
+    ended = _now_ms()
+    result = {
+        "token": token,
+        "cf_tokens": {"cf-turnstile-response": token},
+    }
+    if siteverify is not None:
+        result["siteverify"] = siteverify
+    result.update({
+        "url": url,
+        "sitekey": sitekey,
+        "sitekey_source": sitekey_source,
+        "challenge_solved": True,
+        "action": action,
+        "cdata": cdata,
+        "proxy": proxy or None,
+        "user_agent": useragent,
+        "browser_type": browser or BROWSER_DEFAULT,
+        "headless": bool(headless),
+        "widget": widget or {},
+        "timing": {
+            "solve_seconds": engine_result.elapsed_time_seconds,
+            "total_ms": ended - started,
+        },
+    })
+    if token.upper() == DUMMY_TOKEN:
+        result["token_type"] = "cloudflare_dummy_token"
+        result["note"] = (
+            "This is Cloudflare's official DUMMY token: the target page uses a "
+            "Turnstile TEST sitekey (e.g. 1x00000000000000000000AA). Cloudflare's "
+            "documentation defines test sitekeys to always return "
+            "'XXXX.DUMMY.TOKEN.XXXX', so this token proves the whole solving "
+            "pipeline works. Dummy tokens are only accepted by Cloudflare TEST "
+            "secret keys; real sitekeys produce production tokens that start "
+            "with '0.' or '1.'"
+        )
+    elif token.startswith("0."):
+        #  classic production token format - no note needed
+        result["token_type"] = "production_token"
+    elif token.startswith("1."):
+        #  newer Cloudflare-issued production format observed on some widgets;
+        #  the widget itself emits it into cf-turnstile-response after the
+        #  challenge passes, so it is a genuine Cloudflare token. Final
+        #  acceptance is proven server-side via siteverify (see /siteverify).
+        result["token_type"] = "production_token"
+        result["note"] = (
+            "Token prefix '1.' is a newer Cloudflare-issued production "
+            "format (emitted by the widget itself after the challenge "
+            "passed). Confirm server-side acceptance via /siteverify "
+            "with the site's secret key."
+        )
+    else:
+        result["warning"] = (
+            "token format looks unusual "
+            "(Turnstile tokens normally start with '0.' or '1.')"
+        )
+    return {
+        "status": "ok",
+        "message": "Challenge solved!",
+        "start_timestamp": started,
+        "end_timestamp": ended,
+        "version": VERSION,
+        "result": result,
+        "solution": {
+            "token": token,
+            "turnstile_response": token,
+            "url": url,
+            "sitekey": sitekey,
+        },
+    }
+
+
+def _error_body(message, started, err_type=None, detail=None, extra=None):
+    ended = _now_ms()
+    body = {
+        "status": "error",
+        "message": _rebrand(message),
+        "start_timestamp": started,
+        "end_timestamp": ended,
+        "version": VERSION,
+    }
+    if err_type:
+        body["error"] = {
+            "type": err_type,
+            "detail": _rebrand(detail) if detail else None,
+        }
+    if extra:
+        body["result"] = extra
+    return body
+
+
+# ------------------------------------------------------------------
+#  Shared handler for GET /solve and POST /v1
+# ------------------------------------------------------------------
+def _handle(url, sitekey=None, action=None, cdata=None, proxy=None,
+            headless=None, useragent=None, max_timeout=None, secret=None,
+            browser=None, worker_wait=None):
+    started = _now_ms()
+    try:
+        if not url or not re.match(r"^https?://", str(url).strip(), re.I):
+            return (_error_body(
+                "A valid 'url' (http/https) is required",
+                started, "InvalidInput"), 400)
+        url = str(url).strip()
+
+        if browser is not None:
+            browser = str(browser).strip().lower() or None
+            if browser and browser not in ALLOWED_BROWSERS:
+                return (_error_body(
+                    f"Unsupported browser '{browser}'; "
+                    f"supported: {', '.join(ALLOWED_BROWSERS)}",
+                    started, "InvalidInput"), 400)
+
+        if isinstance(proxy, dict):
+            proxy = proxy.get("url") or proxy.get("server") or None
+        if proxy is not None:
+            proxy = str(proxy).strip() or None
+
+        sitekey_source = "provided"
+        widget = {}
+        if sitekey:
+            sitekey = str(sitekey).strip()
+        else:
+            log.info("sitekey not provided -> smart inspection: %s", url)
+            info = _inspect_page(url)
+            widget = dict(info.get("widget") or {})
+            if info.get("sitekey"):
+                sitekey = info["sitekey"]
+                sitekey_source = info.get("sitekey_source") or "auto_detected"
+                log.info("auto-detected sitekey: %s...", sitekey[:12])
+            else:
+                reason = (
+                    "target page could not be fetched"
+                    if not info.get("page_fetched")
+                    else "no Turnstile widget found on the page"
+                )
+                extra = {
+                    "url": url,
+                    "inspection": {
+                        k: v for k, v in info.items() if k != "sitekey"
+                    },
+                }
+                return (_error_body(
+                    "Sitekey is required and auto-detection failed: "
+                    f"{reason}. Pass 'sitekey' explicitly.",
+                    started, "SitekeyNotFound", extra=extra), 422)
+
+        if not action and widget.get("action"):
+            action = widget.get("action")
+        if not cdata and widget.get("cdata"):
+            cdata = widget.get("cdata")
+
+        attempts = None
+        if max_timeout:
+            try:
+                attempts = max(3, min(int(round(int(max_timeout) / 2500)), 40))
+            except Exception:
+                attempts = None
+
+        #  v3.3.0 UA policy: only an explicit UA (param / ELMINYAWE_UA) is
+        #  forced; otherwise the engine uses the real browser UA (headed)
+        #  or a version-matched auto UA (headless). Never mix them.
+        explicit_ua = useragent or os.environ.get("ELMINYAWE_UA") or None
+        display_ua = explicit_ua or "auto (real browser UA)"
+        headless = HEADLESS_DEFAULT if headless is None else bool(headless)
+
+        if not _WORKERS.acquire(
+            timeout=WORKER_WAIT if worker_wait is None else worker_wait
+        ):
+            return (_error_body(
+                "Solver busy: all worker slots are in use, retry shortly",
+                started, "Busy"), 503)
+        try:
+            log.info("solving: %s | sitekey=%s... | action=%s | proxy=%s | browser=%s",
+                     url, (sitekey or "?")[:12], action or "-", bool(proxy),
+                     browser or BROWSER_DEFAULT)
+            engine_result = _solve_turnstile(
+                url=url, sitekey=sitekey, action=action, cdata=cdata,
+                proxy=proxy, headless=headless,
+                useragent=explicit_ua, attempts=attempts, browser=browser,
+            )
+        finally:
+            _WORKERS.release()
+
+        token = (engine_result.turnstile_value or "").strip()
+        if engine_result.status == "success" and token and len(token) >= 20:
+            log.info("solved in %ss (token=%s...)",
+                     engine_result.elapsed_time_seconds, token[:12])
+            verify_block = None
+            if secret:
+                log.info("validating the token through Cloudflare siteverify")
+                verify_block = _siteverify(token, str(secret).strip())
+            body = _ok_body(url=url, sitekey=sitekey,
+                            sitekey_source=sitekey_source, token=token,
+                            widget=widget, action=action, cdata=cdata,
+                            proxy=proxy, headless=headless,
+                            useragent=display_ua, started=started,
+                            engine_result=engine_result,
+                            siteverify=verify_block, browser=browser)
+            return body, 200
+
+        if engine_result.status == "failure":
+            code, err_type = 504, "SolveTimeout"
+        elif engine_result.status == "error":
+            code, err_type = 502, "EngineError"
+        else:
+            code, err_type = 502, "InvalidToken"
+        message = engine_result.reason or "the engine returned an empty or invalid token"
+        detail = (f"token={token!r}" if err_type == "InvalidToken" else message)
+        return (_error_body(f"Could not solve the challenge: {message}",
+                            started, err_type, detail=detail,
+                            extra={"hints": _failure_hints()}), code)
+
+    except Exception as exc:
+        log.exception("unexpected error")
+        return (_error_body(
+            f"Unexpected internal error: {type(exc).__name__}: {exc}",
+            started, "InternalError"), 500)
+
+
+# ------------------------------------------------------------------
+#  Browser availability (for /health)
+# ------------------------------------------------------------------
+def _browser_info():
+    cache = os.path.expanduser("~/.cache/ms-playwright")
+    hits = sorted(glob.glob(os.path.join(cache, "chromium-*")))
+    if not hits:
+        return False, "chromium browser not found (patchright install missing)"
+    detail = os.path.basename(hits[-1])
+    #  chrome channel (real Google Chrome, like the reference Docker recipe)
+    if (glob.glob(os.path.join(cache, "chrome-*"))
+            or os.path.exists("/opt/google/chrome/chrome")):
+        detail += " + chrome channel"
+    return True, detail
+
+
+_BROWSER_OK, _BROWSER_DETAIL = _browser_info()
+
+
+# ------------------------------------------------------------------
+#  Endpoints
+# ------------------------------------------------------------------
+@app.get("/")
+def root():
+    # Avoid angle-bracket placeholders in JSON: some clients display their
+    # HTML-safe escapes as literal \u003C / \u003E text.
+    return {
+        "name": SERVICE_NAME,
+        "version": VERSION,
+        "status": "ok",
+        "endpoints": {
+            "GET /": "Service information",
+            "GET /health": "Browser and engine readiness",
+            "GET /diagnose": "Connectivity diagnostics; selftest=true runs a live test",
+            "GET /solve": "Solve a Turnstile widget; required: url; optional: sitekey, action, cdata, proxy, secret, browser",
+            "POST /v1": "Solve a Turnstile widget; JSON body with url and optional sitekey, action, cdata, proxy, headless, useragent, maxTimeout, secret, browser",
+            "GET/POST /task": "Start an asynchronous solve; returns task_id and HTTP 202",
+            "GET /result": "Poll a task using task_id",
+            "GET /tasks": "List tracked tasks",
+            "GET /siteverify": "Validate a token using token and secret",
+            "POST /siteverify": "Validate a token using a JSON body with token and secret",
+        },
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok" if _BROWSER_OK else "degraded",
+        "browser": _BROWSER_DETAIL,
+        "engine_ready": _BROWSER_OK,
+        "max_concurrent": MAX_CONCURRENT,
+        "listeners": [p for p in _LISTENERS.split(",") if p],
+        "version": VERSION,
+    }
+
+
+@app.get("/diagnose")
+def diagnose(selftest: Optional[bool] = Query(False)):
+    """Engine + connectivity diagnostics (token first when selftest runs)."""
+    started = _now_ms()
+    probe = _connectivity_probe()
+    v4_ok, v4_detail, v4_ms = probe["v4"]
+    v6_ok, v6_detail, v6_ms = probe["v6"]
+
+    body = {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "engine": {
+            "browser": _BROWSER_DETAIL,
+            "engine_ready": _BROWSER_OK,
+            "max_concurrent": MAX_CONCURRENT,
+        },
+        "connectivity": {
+            "challenges_api_ipv4": {
+                "reachable": v4_ok,
+                "detail": v4_detail,
+                "elapsed_ms": v4_ms,
+            },
+            "ipv6_challenge_egress": {
+                "available": v6_ok,
+                "probe_host": _IPV6_PROBE_HOST,
+                "detail": v6_detail,
+                "elapsed_ms": v6_ms,
+            },
+        },
+    }
+
+    verdict_parts = []
+    if _BROWSER_OK:
+        verdict_parts.append("engine ready (" + _BROWSER_DETAIL + ")")
+    else:
+        verdict_parts.append("engine browser missing")
+    if v4_ok and v6_ok:
+        verdict_parts.append("dual-stack egress: all widget types supported")
+    elif v4_ok:
+        verdict_parts.append(
+            "IPv4-only egress: widgets routed through IPv6-only challenge "
+            "endpoints need an IPv6 proxy or Outbound IPv6 enabled"
+        )
+    else:
+        verdict_parts.append("no path to the challenge infrastructure at all")
+    body["connectivity"]["verdict"] = ". ".join(verdict_parts) + "."
+
+    if selftest:
+        t0 = _now_ms()
+        res = _solve_turnstile(url="https://" + _IPV4_PROBE_HOST,
+                               sitekey="1x00000000000000000000AA",
+                               attempts=6, headless=HEADLESS_DEFAULT)
+        tok = (res.turnstile_value or "")
+        selftest_block = {
+            "token": tok or None,
+            "token_type": ("cloudflare_dummy_token"
+                           if tok == DUMMY_TOKEN else None),
+            "engine_status": res.status,
+            "reason": res.reason,
+            "elapsed_ms": _now_ms() - t0,
+        }
+        # token-first convention: the selftest block leads the response
+        body = {"selftest": selftest_block, **body}
+    return body
+
+
+@app.get("/solve")
+def solve_get(
+    url: str = Query(...),
+    sitekey: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    cdata: Optional[str] = Query(None),
+    proxy: Optional[str] = Query(None),
+    headless: Optional[bool] = Query(None),
+    useragent: Optional[str] = Query(None),
+    maxTimeout: Optional[int] = Query(None),
+    secret: Optional[str] = Query(None),
+    browser: Optional[str] = Query(None),
+):
+    body, code = _handle(url, sitekey=sitekey, action=action, cdata=cdata,
+                         proxy=proxy, headless=headless, useragent=useragent,
+                         max_timeout=maxTimeout, secret=secret, browser=browser)
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.post("/v1")
+async def v1(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    # the engine (patchright sync) must NOT run inside the event loop:
+    # solve in the worker threadpool, exactly like the container did before
+    body, code = await run_in_threadpool(
+        _handle,
+        payload.get("url") or payload.get("u"),
+        sitekey=payload.get("sitekey") or payload.get("siteKey") or payload.get("site_key"),
+        action=payload.get("action"),
+        cdata=payload.get("cdata"),
+        proxy=payload.get("proxy"),
+        headless=payload.get("headless"),
+        useragent=payload.get("useragent") or payload.get("user_agent"),
+        max_timeout=payload.get("maxTimeout") or payload.get("max_timeout"),
+        secret=payload.get("secret") or payload.get("siteverify_secret"),
+        browser=payload.get("browser") or payload.get("browser_type"),
+    )
+    return JSONResponse(status_code=code, content=body)
+
+
+# ------------------------------------------------------------------
+#  Async task API (task_id + /result polling)
+# ------------------------------------------------------------------
+_TASKS = {}
+_TASKS_LOCK = threading.Lock()
+
+
+def _task_cleanup():
+    """Drop finished tasks older than the TTL."""
+    now = _now_ms()
+    with _TASKS_LOCK:
+        expired = [tid for tid, t in _TASKS.items()
+                   if t.get("finished_at")
+                   and now - t["finished_at"] > TASK_TTL * 1000]
+        for tid in expired:
+            _TASKS.pop(tid, None)
+
+
+def _task_worker(task_id, kwargs):
+    with _TASKS_LOCK:
+        task = _TASKS.get(task_id)
+        if task is not None:
+            task["status"] = "processing"
+    try:
+        body, _code = _handle(worker_wait=TASK_WAIT, **kwargs)
+        status = "ok" if body.get("status") == "ok" else "error"
+    except Exception as exc:
+        log.exception("task %s failed unexpectedly", task_id)
+        body = _error_body(
+            f"Unexpected internal error: {type(exc).__name__}: {exc}",
+            _now_ms(), "InternalError")
+        status = "error"
+    with _TASKS_LOCK:
+        task = _TASKS.get(task_id)
+        if task is not None:
+            task["status"] = status
+            task["finished_at"] = _now_ms()
+            task["body"] = body
+
+
+def _create_task(payload):
+    """Validate a solve request and queue it as a background task."""
+    now = _now_ms()
+    url = payload.get("url")
+    if not url or not re.match(r"^https?://", str(url).strip(), re.I):
+        return (_error_body("A valid 'url' (http/https) is required",
+                            now, "InvalidInput"), 400)
+    browser = payload.get("browser")
+    if browser is not None:
+        browser = str(browser).strip().lower() or None
+        if browser and browser not in ALLOWED_BROWSERS:
+            return (_error_body(
+                f"Unsupported browser '{browser}'; "
+                f"supported: {', '.join(ALLOWED_BROWSERS)}",
+                now, "InvalidInput"), 400)
+    solve_kwargs = {
+        "url": str(url).strip(),
+        "sitekey": (payload.get("sitekey") or payload.get("siteKey")
+                    or payload.get("site_key")),
+        "action": payload.get("action"),
+        "cdata": payload.get("cdata"),
+        "proxy": payload.get("proxy"),
+        "headless": payload.get("headless"),
+        "useragent": payload.get("useragent") or payload.get("user_agent"),
+        "max_timeout": payload.get("maxTimeout") or payload.get("max_timeout"),
+        "secret": payload.get("secret") or payload.get("siteverify_secret"),
+        "browser": browser,
+    }
+    task_id = str(uuid.uuid4())
+    with _TASKS_LOCK:
+        _TASKS[task_id] = {
+            "status": "queued",
+            "url": solve_kwargs["url"],
+            "created_at": now,
+            "finished_at": None,
+            "body": None,
+        }
+    threading.Thread(target=_task_worker,
+                     args=(task_id, solve_kwargs), daemon=True).start()
+    _task_cleanup()
+    body = {
+        "task_id": task_id,
+        "status": "queued",
+        "message": "task accepted; poll GET /result?task_id=<task_id> for the token",
+        "start_timestamp": now,
+        "end_timestamp": now,
+        "version": VERSION,
+        "task": {
+            "url": solve_kwargs["url"],
+            "sitekey": solve_kwargs["sitekey"] or "auto_detect",
+            "browser": browser or BROWSER_DEFAULT,
+            "created_at": now,
+        },
+    }
+    return body, 202
+
+
+def _task_view(task_id):
+    with _TASKS_LOCK:
+        task = _TASKS.get(task_id)
+        if task is None:
+            return (_error_body("Unknown or expired task_id",
+                                _now_ms(), "TaskNotFound"), 404)
+        if task["body"] is not None:
+            out = {"task_id": task_id}
+            out.update(task["body"])
+            return out, 200
+        return {
+            "task_id": task_id,
+            "status": task["status"],
+            "message": "solve in progress; poll GET /result?task_id=<task_id>",
+            "start_timestamp": task["created_at"],
+            "version": VERSION,
+        }, 200
+
+
+@app.get("/task")
+def task_get(
+    url: str = Query(...),
+    sitekey: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    cdata: Optional[str] = Query(None),
+    proxy: Optional[str] = Query(None),
+    headless: Optional[bool] = Query(None),
+    useragent: Optional[str] = Query(None),
+    maxTimeout: Optional[int] = Query(None),
+    secret: Optional[str] = Query(None),
+    browser: Optional[str] = Query(None),
+):
+    payload = {"url": url, "sitekey": sitekey, "action": action,
+               "cdata": cdata, "proxy": proxy, "headless": headless,
+               "useragent": useragent, "maxTimeout": maxTimeout,
+               "secret": secret, "browser": browser}
+    body, code = _create_task(payload)
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.post("/task")
+async def task_post(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    body, code = _create_task(payload)
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.get("/result")
+def result_get(task_id: str = Query(...)):
+    body, code = _task_view(str(task_id).strip())
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.get("/tasks")
+def tasks_list():
+    with _TASKS_LOCK:
+        items = [{
+            "task_id": tid,
+            "status": t["status"],
+            "url": t["url"],
+            "created_at": t["created_at"],
+            "finished_at": t["finished_at"],
+        } for tid, t in _TASKS.items()]
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    active = sum(1 for i in items if i["status"] in ("queued", "processing"))
+    return {
+        "status": "ok",
+        "active_tasks": active,
+        "total_tracked": len(items),
+        "version": VERSION,
+        "tasks": items[:50],
+    }
+
+
+# ------------------------------------------------------------------
+#  Standalone token validation (Cloudflare siteverify)
+# ------------------------------------------------------------------
+def _verify_handle(token, secret):
+    started = _now_ms()
+    if not token or not str(token).strip():
+        return (_error_body("A 'token' is required to verify",
+                            started, "InvalidInput"), 400)
+    if not secret or not str(secret).strip():
+        return (_error_body(
+            "A 'secret' is required (the Turnstile secret key paired with the sitekey)",
+            started, "InvalidInput"), 400)
+    token = str(token).strip()
+    verdict = _siteverify(token, str(secret).strip())
+    if verdict.get("success") is None:
+        return (_error_body(
+            "Could not reach Cloudflare siteverify, try again",
+            started, "SiteverifyUnreachable", detail=verdict.get("error"),
+            extra={"token": token}), 502)
+    accepted = bool(verdict.get("success"))
+    body = {
+        "status": "ok" if accepted else "error",
+        "message": ("Token accepted by Cloudflare siteverify" if accepted
+                    else "Token rejected by Cloudflare siteverify"),
+        "start_timestamp": started,
+        "end_timestamp": _now_ms(),
+        "version": VERSION,
+        "result": {
+            "token": token,
+            "siteverify": verdict,
+        },
+    }
+    if token.upper() == DUMMY_TOKEN:
+        body["result"]["token_type"] = "cloudflare_dummy_token"
+    return body, 200
+
+
+@app.get("/siteverify")
+def siteverify_get(
+    token: str = Query(...),
+    secret: str = Query(...),
+):
+    body, code = _verify_handle(token, secret)
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.post("/siteverify")
+async def siteverify_post(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    body, code = await run_in_threadpool(
+        _verify_handle,
+        payload.get("token") or payload.get("response"),
+        payload.get("secret"),
+    )
+    return JSONResponse(status_code=code, content=body)
+
+
+# ------------------------------------------------------------------
+#  White-labeled error handlers
+# ------------------------------------------------------------------
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "message": _rebrand(str(exc.detail)),
+            "version": VERSION,
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request, exc):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "status": "error",
+            "message": "Invalid request parameters: a valid 'url' is required",
+            "version": VERSION,
+        },
+    )
+
+
+log.info("%s v%s ready | browser: %s | max_concurrent=%d",
+         SERVICE_NAME, VERSION, _BROWSER_DETAIL, MAX_CONCURRENT)
+ELMINYAWE_SOURCE_1
+
+RUN cat > /app/turn/elminyawe_launch.py <<'ELMINYAWE_SOURCE_2'
+"""ELMINYAWE launcher: one process, one app, explicit listener sockets."""
+import os
+import socket
+import sys
+
+
+def resolve_listeners(env=None):
+    """Return the ordered unique port list.
+
+    1) ELMINYAWE_PORT (default 8191)  -> primary public API port, always first
+    2) PORT (platform-injected, e.g. Railway 8080) -> compat alias, only when
+       it is a valid port number and different from the primary
+    """
+    env = os.environ if env is None else env
+    try:
+        primary = int(str(env.get("ELMINYAWE_PORT", "8191")).strip() or 8191)
+    except (TypeError, ValueError):
+        primary = 8191
+    if not (1 <= primary <= 65535):
+        primary = 8191
+
+    ports = [primary]
+    raw = str(env.get("PORT", "") or "").strip()
+    if raw.isdigit():
+        alias = int(raw)
+        if 1 <= alias <= 65535 and alias != primary:
+            ports.append(alias)
+    return ports
+
+
+def open_sockets(host, ports):
+    socks = []
+    for port in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.listen(2048)
+        s.set_inheritable(True)
+        socks.append(s)
+    return socks
+
+
+def main():
+    host = os.environ.get("HOST", "0.0.0.0")
+    ports = resolve_listeners()
+    socks = open_sockets(host, ports)
+    os.environ["ELMINYAWE_LISTENERS"] = ",".join(str(p) for p in ports)
+
+    import uvicorn
+    from elminyawe_api import app  # noqa: F401  (single shared app instance)
+
+    for port in ports:
+        print(f"[ELMINYAWE] API listening on {host}:{port}", flush=True)
+    print("[ELMINYAWE] worker: internal (in-process Chromium, no TCP port)",
+          flush=True)
+
+    cfg = uvicorn.Config("elminyawe_api:app", log_level="info", workers=1)
+    server = uvicorn.Server(cfg)
+    import asyncio
+    asyncio.run(server.serve(sockets=socks))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
+ELMINYAWE_SOURCE_2
+
+RUN cat > /app/ug/elminyawe_api.py <<'ELMINYAWE_SOURCE_3'
+# ============================================================
+# ELMINYAWE API — Smart Solver Gateway
+#
+# Endpoints:
+#   GET  /         -> service info
+#   GET  /health   -> solver status
+#   GET  /solve    -> smart solving: /solve?url=<target>&session=<opt>&maxTimeout=<opt>
+#   POST /v1       -> full solving API (important data first, HTML last)
+# ============================================================
+
+from fastapi import FastAPI, Query, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
+from typing import Optional
+
+import os
+import re
+import requests
+import json
+
+SOLVER_URL = os.environ.get("SOLVER_URL") or "http://127.0.0.1:8080"
+SOLVE_TIMEOUT = 180
+
+SERVICE = "ELMINYAWE"
+DEVELOPER = "ELMINYAWE"
+
+app = FastAPI(
+    title="ELMINYAWE",
+    description="ELMINYAWE API - Smart Solver Gateway",
+    version="2.0.0"
+)
+
+
+# ============================================================
+# SMART EXTRACTION (cookies / tokens)
+# ============================================================
+
+INPUT_NAME_FIRST = re.compile(
+    r'<input\b[^>]*?name\s*=\s*["\']([^"\']+)["\'][^>]*?value\s*=\s*["\']([^"\']*)["\']',
+    re.IGNORECASE | re.DOTALL
+)
+
+INPUT_VALUE_FIRST = re.compile(
+    r'<input\b[^>]*?value\s*=\s*["\']([^"\']*)["\'][^>]*?name\s*=\s*["\']([^"\']+)["\']',
+    re.IGNORECASE | re.DOTALL
+)
+
+# technical token fields only (turnstile / csrf / hidden challenge fields ...)
+TOKEN_NAME_FILTER = re.compile(
+    r"(^cf|__cf|turnstile|captcha|recaptcha|hcaptcha|csrf|xsrf|token|jsl|mdrd|chl|challenge)",
+    re.IGNORECASE
+)
+
+MAX_HTML_TOKENS = 25
+MAX_TOKEN_LENGTH = 8192
+
+
+def extract_html_tokens(html):
+
+    """Extract useful tokens (turnstile / csrf / hidden challenge fields) from HTML."""
+
+    tokens = {}
+
+    if not html or not isinstance(html, str):
+        return tokens
+
+    for name, value in INPUT_NAME_FIRST.findall(html):
+
+        name = name.strip()
+        value = value.strip()
+
+        if value and len(value) <= MAX_TOKEN_LENGTH and TOKEN_NAME_FILTER.search(name):
+            tokens[name] = value
+
+    for value, name in INPUT_VALUE_FIRST.findall(html):
+
+        name = name.strip()
+        value = value.strip()
+
+        if value and len(value) <= MAX_TOKEN_LENGTH and TOKEN_NAME_FILTER.search(name):
+            if name not in tokens:
+                tokens[name] = value
+
+    if len(tokens) > MAX_HTML_TOKENS:
+        tokens = dict(list(tokens.items())[:MAX_HTML_TOKENS])
+
+    return tokens
+
+
+def is_cf_cookie(name):
+
+    n = str(name).lower()
+    return n.startswith("cf") or n.startswith("__cf")
+
+
+# ============================================================
+# BRANDING (the solver stays completely hidden)
+# ============================================================
+
+def deep_rebrand(value, skip_key=None):
+
+    if isinstance(value, dict):
+        return {k: deep_rebrand(v, skip_key=k) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [deep_rebrand(v) for v in value]
+
+    if isinstance(value, str):
+
+        if skip_key == "response":
+            # the target site HTML -> never touched
+            return value
+
+        if "FlareSolverr" in value:
+            value = value.replace("FlareSolverr", "ELMINYAWE Solver")
+
+        if "flaresolverr" in value.lower():
+            value = re.sub(r"flaresolverr", "elminyawe", value, flags=re.IGNORECASE)
+
+        return value
+
+    return value
+
+
+# ============================================================
+# SMART RESPONSE (important values FIRST, HTML LAST)
+# ============================================================
+
+def reorder_solution(solution):
+
+    """Reorder solution keys -> the HTML "response" is ALWAYS the last key."""
+
+    ordered = {}
+
+    for key in ("url", "status", "userAgent", "cookies", "headers"):
+        if key in solution:
+            ordered[key] = solution[key]
+
+    for key, value in solution.items():
+        if key != "response" and key not in ordered:
+            ordered[key] = value
+
+    if "response" in solution:
+        ordered["response"] = solution["response"]
+
+    return ordered
+
+
+def build_result(solution, message, session_value=None, start_ts=None, end_ts=None):
+
+    cookies = solution.get("cookies") or []
+    if not isinstance(cookies, list):
+        cookies = []
+
+    cookies_map = {}
+
+    for cookie in cookies:
+        if isinstance(cookie, dict) and cookie.get("name"):
+            cookies_map[str(cookie["name"])] = cookie.get("value", "")
+
+    cf_tokens = {n: v for n, v in cookies_map.items() if is_cf_cookie(n)}
+    html_tokens = extract_html_tokens(solution.get("response"))
+
+    challenge_solved = ("cf_clearance" in cookies_map) or ("challenge solved" in str(message).lower())
+
+    result = {
+        "url": solution.get("url"),
+        "http_status": solution.get("status"),
+        "user_agent": solution.get("userAgent"),
+        "session": session_value,
+        "challenge_solved": challenge_solved,
+        "cookies": cookies,
+        "cookies_map": cookies_map,
+        "cf_tokens": cf_tokens,
+        "html_tokens": html_tokens,
+        "headers": solution.get("headers") if isinstance(solution.get("headers"), dict) else {}
+    }
+
+    if isinstance(start_ts, int) and isinstance(end_ts, int):
+        result["timing"] = {
+            "start_timestamp": start_ts,
+            "end_timestamp": end_ts,
+            "elapsed_ms": max(0, end_ts - start_ts)
+        }
+
+    return result
+
+
+def build_smart_response(data, session_value=None):
+
+    """Full response: "result" (important values) FIRST, "solution" (HTML) LAST."""
+
+    data = deep_rebrand(data)
+
+    message = data.get("message") if isinstance(data.get("message"), str) else data.get("msg")
+    solution = data.get("solution") if isinstance(data.get("solution"), dict) else None
+
+    ordered = {}
+
+    ordered["status"] = data.get("status")
+    ordered["message"] = message
+    ordered["service"] = SERVICE
+    ordered["developer"] = DEVELOPER
+
+    if solution is not None:
+        ordered["result"] = build_result(
+            solution,
+            message or "",
+            session_value,
+            data.get("startTimestamp"),
+            data.get("endTimestamp")
+        )
+
+    for key, value in data.items():
+        if key != "solution" and key not in ordered:
+            ordered[key] = value
+
+    if solution is not None:
+        ordered["solution"] = reorder_solution(solution)
+
+    return ordered
+
+
+def build_branded_response(data):
+
+    """For sessions commands / errors: branding only, keep everything."""
+
+    data = deep_rebrand(data)
+
+    ordered = {}
+
+    for key in ("status", "message", "msg"):
+        if key in data:
+            ordered[key] = data[key]
+
+    ordered["service"] = SERVICE
+    ordered["developer"] = DEVELOPER
+
+    for key, value in data.items():
+        if key not in ordered:
+            ordered[key] = value
+
+    return ordered
+
+
+# ============================================================
+# SOLVER CALL (shared by /solve and /v1)
+# ============================================================
+
+def call_solver(body, session_value=None):
+
+    try:
+
+        response = requests.post(
+            f"{SOLVER_URL}/v1",
+            json=body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            timeout=SOLVE_TIMEOUT
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "service": SERVICE,
+                    "developer": DEVELOPER,
+                    "response": response.text
+                }
+            )
+
+        if isinstance(data, dict) and isinstance(data.get("solution"), dict):
+            content = build_smart_response(data, session_value)
+        elif isinstance(data, dict):
+            content = build_branded_response(data)
+        else:
+            content = data
+
+        return JSONResponse(
+            status_code=response.status_code,
+            content=content
+        )
+
+    except requests.exceptions.Timeout:
+
+        return JSONResponse(
+            status_code=504,
+            content={
+                "status": "error",
+                "service": SERVICE,
+                "developer": DEVELOPER,
+                "error": "Solving timeout"
+            }
+        )
+
+    except requests.exceptions.RequestException as e:
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "service": SERVICE,
+                "developer": DEVELOPER,
+                "error": "Solver connection failed",
+                "details": str(e)
+            }
+        )
+
+    except Exception as e:
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "service": SERVICE,
+                "developer": DEVELOPER,
+                "error": str(e)
+            }
+        )
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "ELMINYAWE",
+        "developer": "ELMINYAWE",
+        "version": "2.0.0",
+        "endpoints": {
+            "GET /solve": "Fetch a URL; required: url; optional: session and maxTimeout",
+            "POST /v1": "Forward a FlareSolverr command in a JSON body; request.get and session commands are supported",
+            "GET /health": "Check the internal FlareSolverr service",
+        }
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    try:
+
+        response = requests.get(
+            f"{SOLVER_URL}/health",
+            timeout=10
+        )
+
+        try:
+            solver_info = deep_rebrand(response.json())
+        except Exception:
+            solver_info = {"raw": response.text[:500]}
+
+        return {
+            "status": "online",
+            "service": SERVICE,
+            "developer": DEVELOPER,
+            "solver": solver_info
+        }
+
+    except Exception as e:
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "offline",
+                "service": SERVICE,
+                "developer": DEVELOPER,
+                "error": str(e)
+            }
+        )
+
+
+# ============================================================
+# SMART SOLVE  ->  /solve?url=<target>&session=<opt>&maxTimeout=<opt>
+# ============================================================
+
+@app.get("/solve")
+def solve_get(
+    url: Optional[str] = Query(None),
+    session: Optional[str] = Query(None),
+    maxTimeout: Optional[int] = Query(None, alias="maxTimeout")
+):
+
+    if not url or not url.strip():
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "service": SERVICE,
+                "developer": DEVELOPER,
+                "error": "Missing required parameter: url  (usage: /solve?url=https://example.com)"
+            }
+        )
+
+    url = url.strip()
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "service": SERVICE,
+                "developer": DEVELOPER,
+                "error": "Invalid url: must start with http:// or https://"
+            }
+        )
+
+    body = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": maxTimeout if maxTimeout is not None else 60000
+    }
+
+    if session and session.strip():
+        body["session"] = session.strip()
+
+    return call_solver(body, body.get("session"))
+
+
+# ============================================================
+# FULL API  ->  POST /v1
+# ============================================================
+
+@app.post("/v1")
+async def solve_v1(request: Request):
+
+    try:
+
+        # Receive RAW body
+        raw_body = await request.body()
+
+        # Parse JSON
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "service": SERVICE,
+                    "developer": DEVELOPER,
+                    "error": "Invalid JSON",
+                    "details": str(e)
+                }
+            )
+
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "service": SERVICE,
+                    "developer": DEVELOPER,
+                    "error": "Invalid payload: JSON object required"
+                }
+            )
+
+        session_value = body.get("session")
+
+        # solve in a worker thread (keeps the API responsive during long solves)
+        return await run_in_threadpool(call_solver, body, session_value)
+
+    except Exception as e:
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "service": SERVICE,
+                "developer": DEVELOPER,
+                "error": str(e)
+            }
+        )
+
+
+# ============================================================
+# 404
+# ============================================================
+
+@app.api_route(
+    "/{path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+    ]
+)
+async def catch_all(request: Request, path: str):
+
+    return JSONResponse(
+        status_code=404,
+        content={
+            "service": SERVICE,
+            "developer": DEVELOPER,
+            "error": "Endpoint not found"
+        }
+    )
+ELMINYAWE_SOURCE_3
+
+RUN cat > /app/gateway.py <<'ELMINYAWE_SOURCE_4'
+"""One public entry point; strip /turn or /ug and forward to the matching local API."""
+import os
+import requests
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from fastapi.concurrency import run_in_threadpool
+
+app = FastAPI(title="ELMINYAWE combined gateway")
+TARGETS = {"turn": "http://127.0.0.1:8192", "ug": "http://127.0.0.1:8193"}
+
+
+def forward(service, path, method, query, body, content_type):
+    try:
+        response = requests.request(
+            method, TARGETS[service] + "/" + path,
+            params=query, data=body,
+            headers={"Content-Type": content_type} if content_type else {},
+            timeout=200,
+        )
+        headers = {}
+        if response.headers.get("content-type"):
+            headers["content-type"] = response.headers["content-type"]
+        return Response(response.content, status_code=response.status_code, headers=headers)
+    except requests.RequestException:
+        return JSONResponse({"status": "error", "message": service + " backend unavailable"}, status_code=502)
+
+
+@app.get("/")
+def root():
+    return {"service": "ELMINYAWE", "routes": ["/turn/solve", "/turn/v1", "/ug/solve", "/ug/v1"], "health": "/health"}
+
+
+@app.get("/health")
+def health():
+    checks = {}
+    for service, url in TARGETS.items():
+        try:
+            r = requests.get(url + "/health", timeout=4)
+            data = r.json() if r.ok else {}
+            ready = (data.get("engine_ready") is True if service == "turn"
+                     else data.get("status") == "online")
+            checks[service] = "online" if ready else "offline"
+        except requests.RequestException:
+            checks[service] = "offline"
+    ok = all(value == "online" for value in checks.values())
+    return JSONResponse({"status": "online" if ok else "offline", "services": checks}, status_code=200 if ok else 503)
+
+
+@app.api_route("/{service}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def route(service: str, path: str, request: Request):
+    if service not in TARGETS:
+        return JSONResponse({"error": "Unknown service; choose /turn/ or /ug/"}, status_code=404)
+    body = await request.body()
+    return await run_in_threadpool(forward, service, path, request.method, request.url.query, body, request.headers.get("content-type"))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT") or "8191"))
+ELMINYAWE_SOURCE_4
+
+RUN cat > /app/supervisor.py <<'ELMINYAWE_SOURCE_5'
+"""Launch both APIs and FlareSolverr in one Railway container."""
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+
+processes = []
+
+
+def stop(*_, code=0):
+    for proc in reversed(processes):
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in reversed(processes):
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    sys.exit(code)
+
+
+def launch(label, argv, env, cwd="/app"):
+    print("Starting", label, flush=True)
+    proc = subprocess.Popen(argv, cwd=cwd, env=env)
+    processes.append(proc)
+    return proc
+
+
+def wait_for(url, timeout=90):
+    until = time.monotonic() + timeout
+    while time.monotonic() < until:
+        if any(p.poll() is not None for p in processes):
+            raise RuntimeError("A service exited while waiting for " + url)
+        try:
+            with urllib.request.urlopen(url, timeout=2) as res:
+                if res.status == 200:
+                    return
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError("Timed out waiting for " + url)
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+try:
+    base = os.environ.copy()
+    flare = base.copy()
+    flare.update(HOST="127.0.0.1", PORT="8194")
+    launch("FlareSolverr", [sys.executable, "-u", "/app/flaresolverr.py"], flare)
+    wait_for("http://127.0.0.1:8194/health")
+
+    if base.get("ELMINYAWE_HEADLESS", "false").lower() == "false":
+        display = base.get("DISPLAY") or ":99"
+        xvfb = launch("Xvfb", ["Xvfb", display, "-screen", "0", "1280x720x24", "-ac", "-nolisten", "tcp"], base)
+        base["DISPLAY"] = display
+        time.sleep(2)
+        if xvfb.poll() is not None:
+            raise RuntimeError("Xvfb failed")
+
+    turn = base.copy()
+    turn.update(HOST="127.0.0.1", ELMINYAWE_PORT="8192", PORT="", PYTHONPATH="/app/turn")
+    launch("Turnstile API", [sys.executable, "-u", "/app/turn/elminyawe_launch.py"], turn, "/app/turn")
+    wait_for("http://127.0.0.1:8192/health")
+
+    ug = base.copy()
+    ug.update(SOLVER_URL="http://127.0.0.1:8194", PYTHONPATH="/app/ug")
+    launch("FlareSolverr API", [sys.executable, "-m", "uvicorn", "elminyawe_api:app", "--host", "127.0.0.1", "--port", "8193"], ug, "/app/ug")
+    wait_for("http://127.0.0.1:8193/health")
+
+    public_port = int(base.get("PORT") or "8191")
+    if public_port in (8192, 8193, 8194):
+        raise RuntimeError("Railway PORT conflicts with an internal port")
+    launch("public gateway", [sys.executable, "-u", "/app/gateway.py"], base)
+    while True:
+        for proc in processes:
+            if proc.poll() is not None:
+                raise RuntimeError("Child exited with status " + str(proc.returncode))
+        time.sleep(2)
+except Exception as exc:
+    print("Fatal:", exc, file=sys.stderr, flush=True)
+    stop(code=1)
+ELMINYAWE_SOURCE_5
+
+EXPOSE 8191
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8191')+'/health',timeout=4)" || exit 1
+CMD ["python", "/app/supervisor.py"]
